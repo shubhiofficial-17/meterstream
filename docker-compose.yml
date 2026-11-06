@@ -1,0 +1,52 @@
+# Full local stack: simulator -> Redis Streams (2 partitions) -> 2 workers -> TimescaleDB -> API/dashboard,
+# with Prometheus scraping the workers.   docker compose up --build   then open http://localhost:8000
+x-app: &app
+  build: .
+  environment: &env
+    BROKER: redis
+    REDIS_URL: redis://redis:6379/0
+    STORE: timescale
+    DATABASE_URL: postgresql://meter:meter@timescaledb:5432/meter
+    PARTITIONS: "2"
+  depends_on:
+    redis: { condition: service_healthy }
+    timescaledb: { condition: service_healthy }
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment: { POSTGRES_USER: meter, POSTGRES_PASSWORD: meter, POSTGRES_DB: meter }
+    volumes: [tsdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U meter"], interval: 5s, retries: 20 }
+
+  simulator:
+    <<: *app
+    command: ["simulate", "--meters", "1000", "--speed", "60", "--backfill-days", "2"]
+
+  worker-0:
+    <<: *app
+    environment: { <<: *env, PARTITION: "0" }
+    command: ["worker", "--consumer", "worker-0"]
+
+  worker-1:
+    <<: *app
+    environment: { <<: *env, PARTITION: "1" }
+    command: ["worker", "--consumer", "worker-1"]
+
+  api:
+    <<: *app
+    command: ["api", "--port", "8000"]
+    ports: ["8000:8000"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: [./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+volumes:
+  tsdata:

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meterstream</title>
+<style>
+  :root { --bg:#0f1419; --card:#182029; --line:#2a3542; --text:#e6edf3; --muted:#8b98a5;
+          --accent:#4fb3ff; --warn:#f2b84b; --crit:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:baseline; }
+  header h1 { font-size:18px; margin:0; } header span { color:var(--muted); }
+  main { padding:20px 24px; display:grid; gap:16px; grid-template-columns: 1fr 1fr; }
+  .tiles { grid-column:1/-1; display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  .tile, .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .tile b { display:block; font-size:24px; margin-top:4px; font-variant-numeric: tabular-nums; }
+  .tile small, th { color:var(--muted); font-weight:500; }
+  .card h2 { font-size:14px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  tr.row { cursor:pointer; } tr.row:hover { background:#1f2a35; }
+  .sev { padding:1px 8px; border-radius:10px; font-size:12px; }
+  .sev.critical { background:#4a1f24; color:var(--crit); } .sev.warning { background:#47391a; color:var(--warn); }
+  #chart { width:100%; height:220px; }
+  .wide { grid-column:1/-1; }
+  @media (max-width:800px) { main { grid-template-columns:1fr; } .tiles { grid-template-columns:repeat(2,1fr); } }
+</style>
+</head>
+<body>
+<header><h1>meterstream</h1><span id="updated">connecting…</span></header>
+<main>
+  <section class="tiles">
+    <div class="tile"><small>Meters reporting</small><b id="meters">–</b></div>
+    <div class="tile"><small>Readings stored</small><b id="readings">–</b></div>
+    <div class="tile"><small>Open incidents</small><b id="open">–</b></div>
+    <div class="tile"><small>Tamper incidents</small><b id="tamper">–</b></div>
+  </section>
+  <section class="card wide">
+    <h2 id="chart-title">Click an incident to see that meter's last 24 hours</h2>
+    <svg id="chart" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>
+  </section>
+  <section class="card wide">
+    <h2>Latest incidents</h2>
+    <table><thead><tr><th>Severity</th><th>Meter</th><th>Kind</th><th>Started (UTC)</th><th>Alerts</th><th>Detail</th></tr></thead>
+    <tbody id="incidents"></tbody></table>
+  </section>
+</main>
+<script>
+const fmt = n => n == null ? "–" : Number(n).toLocaleString();
+const when = ts => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ");
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function refresh() {
+  try {
+    const [s, inc] = await Promise.all([fetch("/api/summary").then(r => r.json()),
+                                        fetch("/api/incidents?limit=25").then(r => r.json())]);
+    document.getElementById("meters").textContent = fmt(s.meters);
+    document.getElementById("readings").textContent = fmt(s.readings);
+    document.getElementById("open").textContent = fmt(s.open_incidents);
+    const k = s.incidents_by_kind || {};
+    document.getElementById("tamper").textContent = fmt((k.register_rollback || 0) + (k.reverse_flow || 0));
+    document.getElementById("updated").textContent = s.latest_ts ? "data up to " + when(s.latest_ts) + " UTC" : "waiting for data";
+    document.getElementById("incidents").innerHTML = inc.map(i => `
+      <tr class="row" data-meter="${esc(i.meter_id)}">
+        <td><span class="sev ${esc(i.severity)}">${esc(i.severity)}</span></td><td>${esc(i.meter_id)}</td>
+        <td>${esc(i.kind.replace("_", " "))}</td><td>${when(i.start_ts)}</td><td>${i.alerts}</td><td>${esc(i.detail)}</td>
+      </tr>`).join("");
+    document.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => showMeter(tr.dataset.meter));
+  } catch (e) { document.getElementById("updated").textContent = "API unreachable"; }
+}
+
+async function showMeter(id) {
+  const rows = await fetch(`/api/meters/${encodeURIComponent(id)}/readings?hours=24`).then(r => r.json());
+  document.getElementById("chart-title").textContent = `${id}: average power, last 24 h (15-minute buckets)`;
+  const svg = document.getElementById("chart");
+  if (!rows.length) { svg.innerHTML = ""; return; }
+  const max = Math.max(...rows.map(r => r.max_power_kw), 0.5), W = 1000, H = 200;
+  const x = i => (i / Math.max(rows.length - 1, 1)) * W, y = v => H - (v / max) * (H - 10) + 5;
+  const line = rows.map((r, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(r.avg_power_kw).toFixed(1)}`).join("");
+  const peak = rows.map((r, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(r.max_power_kw).toFixed(1)}`).join("");
+  svg.innerHTML = `<path d="${peak}" fill="none" stroke="#f2b84b" stroke-width="1" opacity=".5"/>
+                   <path d="${line}" fill="none" stroke="#4fb3ff" stroke-width="2"/>
+                   <text x="4" y="14" fill="#8b98a5" font-size="12">${max.toFixed(1)} kW</text>`;
+}
+
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
